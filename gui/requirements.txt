@@ -6,7 +6,7 @@ matplotlib==3.8.*
 opencv-contrib-python-headless==4.*
 pandas==1.5.*
 pyside6==6.7.*
-python-magic==0.4.*
+python-magic-bin==0.4.*
 rawpy==0.19.*
 scikit-learn==1.5.*
 sewar==0.4.*

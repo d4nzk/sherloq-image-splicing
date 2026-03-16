@@ -3,6 +3,9 @@
 
 # virtualenv
 .venv/
+.venv-312/
+.venv-313/
+requirements-testing/
 
 # byte-compiled/optimized/DLL files
 __pycache__/
