@@ -1,0 +1,267 @@
+import cv2 as cv
+import numpy as np
+from time import time
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QVBoxLayout, QPushButton, 
+                               QMessageBox, QTabWidget, QSlider, QLabel, QWidget)
+
+from skimage.segmentation import slic, mark_boundaries
+from tools import ToolWidget
+from viewer import ImageViewer
+from utility import modify_font
+
+# --- 1. THE MATH WORKER THREAD ---
+class ConsensusWorker(QThread):
+    # Only sending back 4 things now: SLIC, and the 3 RAW normalized lenses
+    finished = Signal(object, object, object, object)  
+    error = Signal(str)
+
+    def __init__(self, image_array):
+        super().__init__()
+        self.image_array = image_array
+
+    def run(self):
+        try:
+            img_bgr = self.image_array
+            img_rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
+            img_gray = cv.cvtColor(img_bgr, cv.COLOR_BGR2GRAY).astype(np.float64)
+
+            # 1. SLIC Segmentation
+            segments = slic(img_rgb, n_segments=400, compactness=10, sigma=1, start_label=1)
+            segment_ids = np.unique(segments)
+
+            # 2. Pre-computing Global Math
+            noise_matrix = cv.Laplacian(img_gray, cv.CV_64F)
+            
+            diff_h = np.abs(img_gray[:, :-1] - img_gray[:, 1:])
+            diff_v = np.abs(img_gray[:-1, :] - img_gray[1:, :])
+            grid_map = np.zeros_like(img_gray)
+            for i in range(7, img_gray.shape[0] - 1, 8):
+                grid_map[i, :] += diff_v[i, :]
+            for j in range(7, img_gray.shape[1] - 1, 8):
+                grid_map[:, j] += diff_h[:, j]
+
+            # 3. Extracting Features
+            noise_heatmap = np.zeros_like(img_gray)
+            dct_heatmap = np.zeros_like(img_gray)
+            freq_heatmap = np.zeros_like(img_gray)
+            
+            for seg_id in segment_ids:
+                mask = (segments == seg_id)
+                noise_heatmap[mask] = np.var(noise_matrix[mask])
+                dct_heatmap[mask] = np.mean(grid_map[mask])
+                
+                y, x = np.where(mask)
+                if len(y) > 0 and len(x) > 0:
+                    roi = img_gray[np.min(y):np.max(y)+1, np.min(x):np.max(x)+1]
+                    if roi.shape[0] > 1 and roi.shape[1] > 1:
+                        f_transform = np.fft.fft2(roi)
+                        f_shift = np.fft.fftshift(f_transform)
+                        freq_heatmap[mask] = np.var(np.abs(f_shift))
+
+            def normalize_heatmap(hm):
+                hm_min, hm_max = hm.min(), hm.max()
+                if hm_max - hm_min == 0:
+                    return np.zeros_like(hm)
+                return (hm - hm_min) / (hm_max - hm_min)
+
+            # 4. Normalize raw lenses and prepare outputs
+            norm_noise = normalize_heatmap(noise_heatmap)
+            norm_dct = normalize_heatmap(dct_heatmap)
+            norm_freq = normalize_heatmap(freq_heatmap)
+            
+            slic_overlay_rgb = mark_boundaries(img_rgb, segments, color=(1, 0, 0))
+            slic_overlay_bgr = cv.cvtColor((slic_overlay_rgb * 255).astype(np.uint8), cv.COLOR_RGB2BGR)
+
+            # Send raw arrays to UI for real-time slider manipulation
+            self.finished.emit(slic_overlay_bgr, norm_noise, norm_dct, norm_freq)
+            
+        except Exception as e:
+            self.error.emit(str(e))
+
+# --- 2. THE UI WIDGET ---
+class EnhancedSplicingWidget(ToolWidget):
+    def __init__(self, image, parent=None):
+        super().__init__(parent)
+        self.image = image
+        self.worker = None
+        
+        # Memory to store the raw math so sliders are instant
+        self.raw_noise = None
+        self.raw_dct = None
+        self.raw_freq = None
+
+        self.run_button = QPushButton("Compute Splicing Analysis")
+        modify_font(self.run_button, bold=True)
+        self.run_button.clicked.connect(self.run_analysis)
+
+        gray_placeholder = np.full_like(self.image, 127)
+        
+        # --- LEFT SIDE: The Tabbed Viewers ---
+        self.tabs = QTabWidget()
+        self.slic_viewer = ImageViewer(self.image, gray_placeholder, "SLIC Superpixels", export=True)
+        self.noise_viewer = ImageViewer(self.image, gray_placeholder, "High-Frequency Noise", export=True)
+        self.dct_viewer = ImageViewer(self.image, gray_placeholder, "DCT Grid", export=True)
+        self.freq_viewer = ImageViewer(self.image, gray_placeholder, "Resampling Frequency", export=True)
+
+        self.tabs.addTab(self.slic_viewer, "SLIC")
+        self.tabs.addTab(self.noise_viewer, "Noise")
+        self.tabs.addTab(self.dct_viewer, "DCT")
+        self.tabs.addTab(self.freq_viewer, "Frequency")
+
+        # --- RIGHT SIDE: The Main Heatmap ---
+        self.heatmap_viewer = ImageViewer(self.image, gray_placeholder, "Final Consensus Heatmap", export=True)
+
+        # Sync Pan/Zoom
+        self.heatmap_viewer.viewChanged.connect(self.slic_viewer.changeView)
+        self.heatmap_viewer.viewChanged.connect(self.noise_viewer.changeView)
+        self.heatmap_viewer.viewChanged.connect(self.dct_viewer.changeView)
+        self.heatmap_viewer.viewChanged.connect(self.freq_viewer.changeView)
+        
+        self.slic_viewer.viewChanged.connect(self.heatmap_viewer.changeView)
+        self.noise_viewer.viewChanged.connect(self.heatmap_viewer.changeView)
+        self.dct_viewer.viewChanged.connect(self.heatmap_viewer.changeView)
+        self.freq_viewer.viewChanged.connect(self.heatmap_viewer.changeView)
+
+        # --- SLIDER CONTROL PANEL ---
+        controls_layout = QHBoxLayout()
+        
+        # Helper to create a slider + label
+        def create_slider(name, default_val):
+            layout = QVBoxLayout()
+            label = QLabel(f"{name}: {default_val}%")
+            label.setAlignment(Qt.AlignCenter)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 100)
+            slider.setValue(default_val)
+            slider.setEnabled(False) # Disabled until math finishes
+            
+            # Connect slider to label text AND the real-time fusion function
+            slider.valueChanged.connect(lambda v: label.setText(f"{name}: {v}%"))
+            slider.valueChanged.connect(self.update_fusion)
+            
+            layout.addWidget(label)
+            layout.addWidget(slider)
+            return slider, layout
+
+        self.sld_noise, l_noise = create_slider("Noise Weight", 40)
+        self.sld_dct, l_dct = create_slider("DCT Weight", 30)
+        self.sld_freq, l_freq = create_slider("Freq Weight", 30)
+        self.sld_thresh, l_thresh = create_slider("Detection Threshold", 60) # Default OPCS 0.60
+        
+        controls_layout.addLayout(l_noise)
+        controls_layout.addLayout(l_dct)
+        controls_layout.addLayout(l_freq)
+        controls_layout.addLayout(l_thresh)
+
+        # Build Main Layout
+        main_layout = QGridLayout()
+        main_layout.addWidget(self.tabs, 0, 0)
+        main_layout.addWidget(self.heatmap_viewer, 0, 1)
+        main_layout.addLayout(controls_layout, 1, 0, 1, 2) # Sliders span both columns
+        main_layout.addWidget(self.run_button, 2, 0, 1, 2) 
+        
+        self.setLayout(main_layout)
+
+    def run_analysis(self):
+        self.start_time = time()
+        self.run_button.setText("Computing Multi-Modal Lenses... Please wait.")
+        modify_font(self.run_button, bold=False, italic=True)
+        self.run_button.setEnabled(False)
+        
+        self.worker = ConsensusWorker(self.image)
+        self.worker.finished.connect(self.on_finished)
+        self.worker.error.connect(self.on_error)
+        self.worker.start()
+
+    def apply_colormap(self, matrix, colormap=cv.COLORMAP_VIRIDIS):
+        uint8_img = (matrix * 255).astype(np.uint8)
+        return cv.applyColorMap(uint8_img, colormap)
+
+    def normalize_heatmap(self, hm):
+        hm_min, hm_max = hm.min(), hm.max()
+        if hm_max - hm_min == 0:
+            return np.zeros_like(hm)
+        return (hm - hm_min) / (hm_max - hm_min)
+
+    def on_finished(self, slic_img, noise_mat, dct_mat, freq_mat):
+        try:
+            # Store raw math in memory
+            self.raw_noise = noise_mat
+            self.raw_dct = dct_mat
+            self.raw_freq = freq_mat
+
+            # Enable sliders
+            self.sld_noise.setEnabled(True)
+            self.sld_dct.setEnabled(True)
+            self.sld_freq.setEnabled(True)
+            self.sld_thresh.setEnabled(True)
+
+            # Update Left Tabs
+            self.slic_viewer.update_processed(slic_img)
+            self.noise_viewer.update_processed(self.apply_colormap(noise_mat, cv.COLORMAP_VIRIDIS))
+            self.dct_viewer.update_processed(self.apply_colormap(dct_mat, cv.COLORMAP_VIRIDIS))
+            self.freq_viewer.update_processed(self.apply_colormap(freq_mat, cv.COLORMAP_VIRIDIS))
+            
+            # Trigger the first fusion instantly
+            self.update_fusion()
+            
+            elapsed = time() - self.start_time
+            self.run_button.setText(f"Analysis Complete ({elapsed:.1f} s)")
+            modify_font(self.run_button, bold=True, italic=False)
+            self.run_button.setEnabled(True)
+            
+            if hasattr(self, 'info_message'):
+                self.info_message.emit("Enhanced Splicing Analysis Complete.")
+                
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(self, "Hidden Error Caught!", f"The UI crashed at:\n{traceback.format_exc()}")
+            self.run_button.setEnabled(True)
+
+    # --- THE REAL-TIME FUSION ENGINE ---
+    # This runs instantly every time you drag a slider!
+    def update_fusion(self):
+        if self.raw_noise is None: return # Prevent running before math is done
+        
+        try:
+            # 1. Grab values from sliders
+            w_n = self.sld_noise.value() / 100.0
+            w_d = self.sld_dct.value() / 100.0
+            w_f = self.sld_freq.value() / 100.0
+            thresh = self.sld_thresh.value() / 100.0
+
+            # 2. Fuse the stored arrays together
+            consensus = (self.raw_noise * w_n) + (self.raw_dct * w_d) + (self.raw_freq * w_f)
+            final_consensus = self.normalize_heatmap(consensus)
+            
+            # 3. Apply the threshold from the slider
+            binary_map = (final_consensus > thresh).astype(np.uint8) * 255
+            
+            # 4. Morphological Cleanup
+            kernel = np.ones((5, 5), np.uint8)
+            cleaned_map = cv.morphologyEx(binary_map, cv.MORPH_OPEN, kernel)
+            cleaned_map = cv.dilate(cleaned_map, kernel, iterations=2)
+            
+            # 5. Draw the Base Heatmap
+            heatmap_colored = self.apply_colormap(final_consensus, cv.COLORMAP_JET)
+
+            # 6. Find ALL contours, and draw a box around any that are big enough!
+            contours, _ = cv.findContours(cleaned_map, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                if cv.contourArea(c) > 100: # Ignore tiny 10x10 pixel false positives
+                    x, y, w, h = cv.boundingRect(c)
+                    cv.rectangle(heatmap_colored, (int(x), int(y)), (int(x + w), int(y + h)), (0, 255, 0), 3) 
+                    cv.putText(heatmap_colored, "SPLICING DETECTED", (int(x), int(y) - 10), 
+                               cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            self.heatmap_viewer.update_processed(heatmap_colored)
+            
+        except Exception as e:
+            print(f"Slider Update Error: {e}")
+
+    def on_error(self, err):
+        QMessageBox.critical(self, "Error", f"Analysis failed: {err}")
+        self.run_button.setText("Compute Splicing Analysis")
+        modify_font(self.run_button, bold=True, italic=False)
+        self.run_button.setEnabled(True)

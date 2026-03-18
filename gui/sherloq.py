@@ -39,6 +39,7 @@ from quality import QualityWidget
 from reverse import ReverseWidget
 from space import SpaceWidget
 from splicing import SplicingWidget
+from enhanced_splicing import EnhancedSplicingWidget
 from stats import StatsWidget
 from stereogram import StereoWidget
 from thumbnail import ThumbWidget
@@ -418,6 +419,8 @@ class MainWindow(QMainWindow):
                 tool_widget = SplicingWidget(self.image)
             elif tool == 3:
                 tool_widget = ResamplingWidget(self.filename, self.image)
+            elif tool == 4:
+                tool_widget = EnhancedSplicingWidget(self.image)
             else:
                 return
         elif group == 8:

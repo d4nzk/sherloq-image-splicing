@@ -214,6 +214,7 @@ class ToolTree(QTreeWidget):
                 self.tr("Copy-Move Forgery"),
                 self.tr("Composite Splicing"),
                 self.tr("Image Resampling"),
+                self.tr("Enhanced Splicing"),
             ]
         )
         tool_infos.append(
@@ -221,12 +222,11 @@ class ToolTree(QTreeWidget):
                 self.tr("Analyze color distributions to detect contrast enhancements"),
                 self.tr("Use invariant feature descriptors to detect cloned regions"),
                 self.tr("Exploit DCT statistics for automatic splicing zone detection"),
-                self.tr(
-                    "Estimate 2D pixel interpolation for detecting resampling traces"
-                ),
+                self.tr("Estimate 2D pixel interpolation for detecting resampling traces"),
+                self.tr("Detect tampering using multi-modal SLIC, NLF, and DCT fusion"),
             ]
         )
-        tool_progress.extend([3, 2, 3, 2])
+        tool_progress.extend([3, 2, 3, 2, 1])
 
 
         # [8]
